@@ -8,6 +8,36 @@ use shakmaty::san::San;
 
 use crate::engine::EngineAnalyzer;
 
+fn classify(cp_loss: i32) -> MoveClass {
+    match cp_loss.abs() {
+        0..=20 => MoveClass::Best,
+        21..=80 => MoveClass::Good,
+        81..=200 => MoveClass::Inaccuracy,
+        201..=400 => MoveClass::Mistake,
+        _ => MoveClass::Blunder,
+    }
+}
+
+fn calculate_accuracy(
+    history: &[MoveAnalysis]
+) -> f32 {
+    if history.len() <= 1 {
+        return 100.0;
+    }
+
+    let mut total = 0.0;
+
+    for mv in history {
+        let value =
+            (100.0 - (mv.cp_loss as f32 * 0.1))
+                .clamp(0.0, 100.0);
+
+        total += value;
+    }
+
+    total / history.len() as f32
+}
+
 fn piece_unicode(
     role: Role,
     color: Color,
@@ -34,6 +64,7 @@ pub struct MoveAnalysis {
     pub fen: String,          // FEN after the move
     pub eval: i32,            // Score in centipawns
     pub best_move: String,    // Engine's suggested best move
+    pub cp_loss: i32,
     pub classification: MoveClass,
 }
 
@@ -52,6 +83,7 @@ pub struct ChessApp {
     pub position: Chess,            // Active board position for rendering
     pub engine: EngineAnalyzer,
     pub selected_square: Option<Square>,
+    pub accuracy: f32,
 }
 
 impl Default for ChessApp {
@@ -63,12 +95,14 @@ impl Default for ChessApp {
                 fen: initial_fen.to_string(),
                 eval: 0,
                 best_move: "-".to_string(),
+                cp_loss: 0,
                 classification: MoveClass::Best,
             }],
             selected_move: 0,
             position: Chess::default(),
             engine: EngineAnalyzer::new("stockfish-windows-x86-64-universal"),
             selected_square: None,
+            accuracy: 100.0,
         }
     }
 }
@@ -85,6 +119,90 @@ impl ChessApp {
             }
         }
     }
+
+    fn load_pgn(
+        &mut self,
+        text: &str,
+    ) {
+        self.history.clear();
+
+        let mut pos = Chess::default();
+
+        self.history.push(
+            MoveAnalysis {
+                san: "Start".to_string(),
+                fen: Fen::from_position(
+                    &pos,
+                    EnPassantMode::Legal,
+                )
+                .to_string(),
+                eval: 0,
+                best_move: "-".to_string(),
+                cp_loss: 0,
+                classification: MoveClass::Best,
+            }
+        );
+
+        for token in text.split_whitespace() {
+
+            // Skip move numbers like "1." "2." etc.
+            if token.contains('.') {
+                continue;
+            }
+
+            // Skip PGN tags
+            if token.starts_with('[') {
+                continue;
+            }
+
+            // Stop at result markers
+            if token == "1-0"
+                || token == "0-1"
+                || token == "1/2-1/2"
+                || token == "*"
+            {
+                break;
+            }
+
+            let san =
+                match token.parse::<San>() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+            let mv =
+                match san.to_move(&pos) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+            let san_text =
+                san.to_string();
+
+            pos.play_unchecked(mv);
+
+            let fen =
+                Fen::from_position(
+                    &pos,
+                    EnPassantMode::Legal,
+                )
+                .to_string();
+
+            self.history.push(
+                MoveAnalysis {
+                    san: san_text,
+                    fen,
+                    eval: 0,
+                    best_move: "-".to_string(),
+                    cp_loss: 0,
+                    classification: MoveClass::Best,
+                }
+            );
+        }
+
+        self.position = Chess::default();
+        self.selected_move = 0;
+    }
 }
 
 impl eframe::App for ChessApp {
@@ -99,7 +217,11 @@ impl eframe::App for ChessApp {
                 if ui.button("📁 Load PGN").clicked() {
                     if let Some(path) = rfd::FileDialog::new().add_filter("PGN Files", &["pgn"]).pick_file() {
                         if let Ok(contents) = std::fs::read_to_string(path) {
-                            println!("Loaded PGN file successfully (Length: {} bytes)", contents.len());
+                            self.load_pgn(&contents);
+                            println!(
+                                "Loaded {} positions",
+                                self.history.len()
+                            );
                         }
                     }
                 }
@@ -192,6 +314,11 @@ impl eframe::App for ChessApp {
                 );
 
                 ui.label(format!("Evaluation: {:.2}", eval_val as f32 / 100.0));
+
+                ui.label(format!(
+                    "Accuracy: {:.1}%",
+                    self.accuracy
+                ));
 
                 ui.separator();
                 ui.label("Best Move:");
@@ -300,11 +427,20 @@ impl eframe::App for ChessApp {
                                                         self.history.truncate(self.selected_move + 1);
                                                     }
 
+                                                    let previous_eval =
+                                                        self.history
+                                                            .last()
+                                                            .map(|m| m.eval)
+                                                            .unwrap_or(0);
+
                                                     let result =
                                                         self.engine.analyze_fen(&new_fen);
 
+                                                    let cp_loss =
+                                                        (previous_eval - result.eval).abs();
+
                                                     let class =
-                                                        classify(result.eval);
+                                                        classify(cp_loss);
 
                                                     self.history.push(
                                                         MoveAnalysis {
@@ -312,9 +448,16 @@ impl eframe::App for ChessApp {
                                                             fen: new_fen,
                                                             eval: result.eval,
                                                             best_move: result.best_move,
+                                                            cp_loss,
                                                             classification: class,
+                                                        
                                                         }
                                                     );
+
+                                                    self.accuracy =
+                                                        calculate_accuracy(
+                                                            &self.history
+                                                        );
 
                                                     self.selected_move = self.history.len() - 1;
                                                 }
@@ -362,12 +505,4 @@ impl eframe::App for ChessApp {
             });
     }
 }
-fn classify(cp_loss: i32) -> MoveClass {
-    match cp_loss.abs() {
-        0..=20 => MoveClass::Best,
-        21..=80 => MoveClass::Good,
-        81..=200 => MoveClass::Inaccuracy,
-        201..=400 => MoveClass::Mistake,
-        _ => MoveClass::Blunder,
-    }
-}
+
