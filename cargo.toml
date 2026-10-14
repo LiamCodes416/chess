@@ -10,3 +10,4 @@ shakmaty = "0.28"
 
 eframe = "0.33"
 egui = "0.33"
+rfd = "0.17.2"
